@@ -1,0 +1,232 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Forward incoming SES Emails to Pinpoint Segment
+
+Parameters:
+  CreateBucketName:
+    Type: String
+    Description: Name of the S3 bucket to create to hold the bodies of the SES emails - needs to be unique across all of AWS
+  PinpointProjectId:
+    Type: String
+    Description: Amazon Pinpoint Project ID
+
+Mappings:
+  SES:
+    RuleSet:
+      RuleSetName: "default-rule-set"
+      ReceiptRuleName: "ForwardIncomingReceiptRule"
+      TlsPolicy: "Optional"
+
+Resources:
+
+  ReceiptRule:
+    Type: AWS::SES::ReceiptRule
+    DependsOn: SESBodyS3Bucket
+    Properties:
+      RuleSetName: !FindInMap ["SES", "RuleSet", "RuleSetName"]
+      Rule:
+        Name: !FindInMap ["SES", "RuleSet", "ReceiptRuleName"]
+        Enabled: true
+        ScanEnabled: true
+        TlsPolicy: !FindInMap ["SES", "RuleSet", "TlsPolicy"]
+        Actions:
+          - S3Action:
+              BucketName: !Ref CreateBucketName
+
+
+  SESBodyS3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Ref CreateBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      NotificationConfiguration:
+        LambdaConfigurations:
+          -
+            Event: "s3:ObjectCreated:*"
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: "prefix"
+                    Value: ""
+            Function: !GetAtt ForwarderLamda.Arn
+
+  SESBodyS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SESBodyS3Bucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Sid: AllowSESPermission
+          Effect: Allow
+          Principal:
+            Service: ses.amazonaws.com
+          Action: "s3:PutObject"
+          Resource: !Sub "arn:aws:s3:::${CreateBucketName}/*"
+
+        - Sid: AllowSSLRequestsOnly
+          Effect: Deny
+          Principal: "*"
+          Action: "s3:*"
+          Resource:
+            - !Sub "arn:aws:s3:::${CreateBucketName}/*"
+            - !Sub "arn:aws:s3:::${CreateBucketName}"
+          Condition:
+            Bool:
+              "aws:SecureTransport": "false"
+
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ForwarderLamda
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::${CreateBucketName}
+      SourceAccount: !Ref "AWS::AccountId"
+
+  ForwarderLamda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt ForwarderLamdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          LOG_LEVEL: "INFO"
+          PINPOINT_PROJECT_ID: !Ref PinpointProjectId
+      Handler: index.lambda_handler
+      Runtime: "python3.7"
+      Timeout: 60
+      MemorySize: 1024
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import boto3
+          import os
+          import email
+          from email import policy
+
+          pinpoint = boto3.client('pinpoint')
+          s3 = boto3.resource('s3')
+
+          def lambda_handler(event, context):
+            global log_level
+            log_level = str(os.environ.get("LOG_LEVEL")).upper()
+            if log_level not in [
+                                    "DEBUG", "INFO",
+                                    "WARNING", "ERROR",
+                                    "CRITICAL"
+                                ]:
+                log_level = "INFO"
+            logging.getLogger().setLevel(log_level)
+
+            logging.info(event)
+
+            # Process all the triggers
+            for record in event['Records']:
+              s3_bucket = record['s3']['bucket']['name']
+              s3_key = record['s3']['object']['key']
+
+              # read the email mime part contents as a string
+              email_obj = s3.Object(s3_bucket, s3_key)
+              email_str = email_obj.get()['Body'].read().decode('utf-8')
+
+              # parse the string into an email object
+              msg = email.message_from_string(email_str, policy=policy.default)
+
+              # get the necessary properties from the email
+              from_address = msg['From']
+              subject = msg['Subject']
+              body = msg.get_body(preferencelist=('html', 'plain')).get_content()
+
+              # TODO - if images are required, then multipart/related sections should also be processed
+              #  see:  https://docs.python.org/3/library/email.message.html#email.message.EmailMessage.get_body
+
+              logging.info(from_address)
+              logging.info(subject)
+              logging.info(body)
+
+              # determine which Pinpoint segment to send to - segments need to be predefined
+              segment_id = None
+              # TODO - maybe store this in a lookup table
+              if from_address == 'test@test.com':
+                segment_id = "12345678abcdefgh"
+              else:
+                raise Exception(f"Found email from unknown FROM address ({from_address}), not forwarding")
+
+              campaign_response = pinpoint.create_campaign(
+                ApplicationId=os.environ.get("PINPOINT_PROJECT_ID"),
+                WriteCampaignRequest={
+                    'MessageConfiguration': {
+                        'EmailMessage': {
+                            'HtmlBody': body,
+                            'Title': subject
+                        }
+                    },
+                    'Name': f"Forwarding - {subject}",   # TODO - needs validation around this to not create an invalide campaign name
+                    'Schedule': {
+                        'Frequency': 'ONCE',
+                        'StartTime': 'IMMEDIATE',
+                        'Timezone': 'UTC'
+                    },
+                    'SegmentId': segment_id
+                }
+              )
+
+              logging.info(campaign_response)
+
+
+
+
+  ForwarderLamdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "s3:AbortMultipartUpload"
+                  - "s3:GetBucketLocation"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:ListBucketMultipartUploads"
+                  - "s3:PutObject"
+                Resource:
+                  - !Sub "arn:aws:s3:::${CreateBucketName}/*"
+                  - !Sub "arn:aws:s3:::${CreateBucketName}"
+              -
+                Effect: "Allow"
+                Action: "mobiletargeting:CreateCampaign"
+                Resource:
+                  - !Sub "arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${PinpointProjectId}*"
+                  - !Sub "arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${PinpointProjectId}"
