@@ -1,6 +1,6 @@
 # SES to Pinpoint Segment Email Forwarder
 
-This repo shows a simple reference architecture on how to set up inbound SES rules to forward incoming emails to different Pinpoint segments.  
+This repo shows a simple reference architecture on how to set up inbound SES rules to forward incoming emails to different Pinpoint segments.  It also sets up a CloudWatch Event Rule to run every 30 min and a CloudWatch Alarm to verify that emails are being received and the Lambda is triggered.
 
 ## Architecture
 
@@ -19,3 +19,5 @@ This repo shows a simple reference architecture on how to set up inbound SES rul
 1. Deploy the [cloudformation.yaml](cloudformation.yaml) file in Amazon CloudFormation to deploy the rest of the architecture.
 
 1. Modify the deployed Lambda to update the mapping of from name to Pinpoint segment ids.
+
+1. Update the CloudWatch Alarm to enable an alerting mechanism that works for your use-case.

@@ -8,6 +8,9 @@ Parameters:
   PinpointProjectId:
     Type: String
     Description: Amazon Pinpoint Project ID
+  SESHeartbeatEmailAddress:
+    Type: String
+    Description: Email address to listen for hearbeats
 
 Mappings:
   SES:
@@ -154,34 +157,38 @@ Resources:
               logging.info(subject)
               logging.info(body)
 
-              # determine which Pinpoint segment to send to - segments need to be predefined
-              segment_id = None
-              # TODO - maybe store this in a lookup table
-              if from_address == 'test@test.com':
-                segment_id = "12345678abcdefgh"
-              else:
-                raise Exception(f"Found email from unknown FROM address ({from_address}), not forwarding")
+              # Ignore the heartbeat messages
+              if subject != 'HEARTBEAT':
 
-              campaign_response = pinpoint.create_campaign(
-                ApplicationId=os.environ.get("PINPOINT_PROJECT_ID"),
-                WriteCampaignRequest={
-                    'MessageConfiguration': {
-                        'EmailMessage': {
-                            'HtmlBody': body,
-                            'Title': subject
-                        }
-                    },
-                    'Name': f"Forwarding - {subject}",   # TODO - needs validation around this to not create an invalide campaign name
-                    'Schedule': {
-                        'Frequency': 'ONCE',
-                        'StartTime': 'IMMEDIATE',
-                        'Timezone': 'UTC'
-                    },
-                    'SegmentId': segment_id
-                }
-              )
+                # determine which Pinpoint segment to send to - segments need to be predefined
+                segment_id = None
+                # TODO - maybe store this in a lookup table
+                if from_address == 'test@test.com':
+                  segment_id = "12345678abcdefgh"
+                else:
+                  raise Exception(f"Found email from unknown FROM address ({from_address}), not forwarding")
 
-              logging.info(campaign_response)
+                campaign_response = pinpoint.create_campaign(
+                  ApplicationId=os.environ.get("PINPOINT_PROJECT_ID"),
+                  WriteCampaignRequest={
+                      'MessageConfiguration': {
+                          'EmailMessage': {
+                              'HtmlBody': body,
+                              'Title': subject
+                          }
+                      },
+                      'Name': f"Forwarding - {subject}",   # TODO - needs validation around this to not create an invalide campaign name
+                      'Schedule': {
+                          'Frequency': 'ONCE',
+                          'StartTime': 'IMMEDIATE',
+                          'Timezone': 'UTC'
+                      },
+                      'SegmentId': segment_id
+                  }
+                )
+
+                logging.info(campaign_response)
+
 
 
 
@@ -230,3 +237,140 @@ Resources:
                 Resource:
                   - !Sub "arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${PinpointProjectId}*"
                   - !Sub "arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${PinpointProjectId}"
+
+
+  HeartbeatRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Heartbeat alarm to test email receiving
+      ScheduleExpression: rate(30 minutes)
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt HearbeatEmailSendLambda.Arn
+          Id: "HeartbeatEmailLambda"
+
+  HeartbeatLambdaPermissions:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HearbeatEmailSendLambda
+      Action: "lambda::InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt HeartbeatRule.Arn
+
+  HearbeatEmailSendLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt HearbeatEmailSendLambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          LOG_LEVEL: "INFO"
+          PINPOINT_PROJECT_ID: !Ref PinpointProjectId
+          SES_RECEIVING_ADDRESS: !Ref SESHeartbeatEmailAddress
+      Handler: index.lambda_handler
+      Runtime: "python3.7"
+      Timeout: 60
+      MemorySize: 1024
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import boto3
+          import os
+          import email
+          from email import policy
+
+          pinpoint = boto3.client('pinpoint')
+
+          def lambda_handler(event, context):
+            global log_level
+            log_level = str(os.environ.get("LOG_LEVEL")).upper()
+            if log_level not in [
+                                    "DEBUG", "INFO",
+                                    "WARNING", "ERROR",
+                                    "CRITICAL"
+                                ]:
+                log_level = "INFO"
+            logging.getLogger().setLevel(log_level)
+
+            logging.info(event)
+
+            ses_email = os.environ.get("SES_RECEIVING_ADDRESS")
+
+            response = pinpoint.send_messages(
+              ApplicationId=os.environ.get("PINPOINT_PROJECT_ID"),
+              MessageRequest={
+                  'Addresses': {
+                      ses_email: {
+                          'ChannelType': 'EMAIL',
+                      }
+                  },
+                  'MessageConfiguration': {
+                      'EmailMessage': {
+                          'SimpleEmail': {
+                              'HtmlPart': {
+                                  'Data': 'HEARTBEAT'
+                              },
+                              'Subject': {
+                                  'Data': 'HEARTBEAT'
+                              }
+                          }
+                      }
+                  }
+              }
+          )
+
+          logging.info(response)
+
+  HearbeatEmailSendLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              -
+                Effect: "Allow"
+                Action: "mobiletargeting:SendMessages"
+                Resource:
+                  - !Sub "arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${PinpointProjectId}*"
+                  - !Sub "arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${PinpointProjectId}"
+
+  HeartbeatAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      ActionsEnabled: TRUE
+      AlarmDescription: "Test to see if the SES email forwarding is still working"
+      ComparisonOperator: LessThanThreshold
+      DatapointsToAlarm: 1
+      Dimensions:
+        -
+          Name: FunctionName
+          Value: !Ref ForwarderLamda
+      EvaluationPeriods: 1
+      MetricName: Invocations
+      Namespace: "AWS/Lambda"
+      Period: 3600
+      Statistic: Sum
+      Threshold: 1.0
+      TreatMissingData: "missing"
